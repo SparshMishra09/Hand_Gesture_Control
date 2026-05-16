@@ -3,7 +3,7 @@ AI Virtual Canvas - Premium Edition
 An interactive, high-performance air-drawing application with:
 - Intelligent Shape Snapping (Circle, Square, Triangle)
 - Rainbow & Neon Glow Brushes
-- Palm-to-Erase Gesture (All 5 fingers up)
+- Palm-to-Erase Gesture (All 4 fingers up)
 - Premium Glassmorphism UI with smooth transitions
 - Real-time Hand Tracking Visualization
 """
@@ -22,9 +22,11 @@ try:
     try:
         from mediapipe.solutions import hands as mp_hands
         from mediapipe.solutions import drawing_utils as mp_drawing
+        from mediapipe.solutions import hand_connections as mp_connections
     except (ImportError, AttributeError):
         from mediapipe.python.solutions import hands as mp_hands
         from mediapipe.python.solutions import drawing_utils as mp_drawing
+        from mediapipe.python.solutions import hand_connections as mp_connections
 except Exception as e:
     print(f"\n[!] Critical: Failed to load MediaPipe: {e}")
     sys.exit(1)
@@ -57,6 +59,8 @@ class PremiumCanvas:
         # Layers
         self.canvas = np.zeros((self.h, self.w, 3), dtype=np.uint8)
         self.glow_layer = np.zeros((self.h, self.w, 3), dtype=np.uint8)
+        # Temporary layer for active strokes so they can be deleted upon shape snapping
+        self.active_stroke_layer = np.zeros((self.h, self.w, 3), dtype=np.uint8)
         
         # MediaPipe
         self.mp_hands = mp_hands
@@ -99,13 +103,10 @@ class PremiumCanvas:
         }
 
     def detect_gesture(self, landmarks):
-        # Index
+        # Finger status checking
         idx_up = landmarks[8].y < landmarks[6].y
-        # Middle
         mid_up = landmarks[12].y < landmarks[10].y
-        # Ring
         ring_up = landmarks[16].y < landmarks[14].y
-        # Pinky
         pinky_up = landmarks[20].y < landmarks[18].y
         
         # PALM ERASE: All 4 main fingers extended
@@ -123,22 +124,70 @@ class PremiumCanvas:
         return 'IDLE'
 
     def process_shape(self):
-        if len(self.current_stroke) < 20: return
-        
-        pts = np.array(self.current_stroke, dtype=np.int32)
-        epsilon = 0.04 * cv2.arcLength(pts, True)
-        approx = cv2.approxPolyDP(pts, epsilon, True)
-        
+        """Intelligent Shape Recognition with Robust Geometric Heuristics"""
+        target = self.glow_layer if self.brush_mode == 'Neon' else self.canvas
         color = self.get_current_color()
-        if len(approx) == 3: # Triangle
-            cv2.drawContours(self.canvas, [approx], 0, color, self.brush_size)
-        elif len(approx) == 4: # Square/Rectangle
-            x, y, w, h = cv2.boundingRect(pts)
-            cv2.rectangle(self.canvas, (x, y), (x + w, y + h), color, self.brush_size)
-        elif len(approx) > 6: # Circle
-            (x, y), radius = cv2.minEnclosingCircle(pts)
-            center = (int(x), int(y))
-            cv2.circle(self.canvas, center, int(radius), color, self.brush_size)
+        
+        def bake_raw_stroke():
+            """Fallback: Permanently write the active stroke to the canvas if it's not a geometric shape"""
+            for i in range(1, len(self.current_stroke)):
+                cv2.line(target, self.current_stroke[i-1], self.current_stroke[i], color, self.brush_size)
+
+        if len(self.current_stroke) < 25: # Too short to be a reliable shape
+            bake_raw_stroke()
+            return
+            
+        pts = np.array(self.current_stroke, dtype=np.int32).reshape((-1, 1, 2))
+        
+        # 1. Closure Check (Start and end points must be near to consider it a closed shape)
+        p1 = self.current_stroke[0]
+        p2 = self.current_stroke[-1]
+        dist_close = math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+        
+        x, y, w, h = cv2.boundingRect(pts)
+        diag = math.hypot(w, h)
+        
+        # If the gap is > 30% of the bounding box diagonal, it's an open doodle or scribble
+        if diag < 40 or dist_close > 0.3 * diag:
+            bake_raw_stroke()
+            return
+            
+        area = cv2.contourArea(pts)
+        perimeter = cv2.arcLength(pts, True)
+        if perimeter == 0 or area < 200: # Area threshold to prevent small noise snaps
+            bake_raw_stroke()
+            return
+            
+        # 2. Geometric Feature Extraction
+        # Circularity = 4 * PI * (Area / Perimeter^2). Perfect circle = 1.0.
+        circularity = 4 * np.pi * area / (perimeter * perimeter)
+        
+        # Simplify contour for polygon detection (Circle/Square/Triangle)
+        epsilon = 0.04 * perimeter
+        approx = cv2.approxPolyDP(pts, epsilon, True)
+        vertices = len(approx)
+        
+        # 3. Decision Logic
+        if circularity > 0.75:
+            # Circle Detected
+            (cx, cy), radius = cv2.minEnclosingCircle(pts)
+            cv2.circle(target, (int(cx), int(cy)), int(radius), color, self.brush_size)
+            
+        elif vertices == 3:
+            # Triangle Detected
+            cv2.drawContours(target, [approx], 0, color, self.brush_size)
+            
+        elif vertices == 4:
+            # Square/Rectangle Detected
+            # The contour area must cover most of the bounding box to be a square (avoids random crosses)
+            box_area = w * h
+            if box_area > 0 and area / box_area > 0.6:
+                cv2.rectangle(target, (x, y), (x + w, y + h), color, self.brush_size)
+            else:
+                bake_raw_stroke()
+        else:
+            # Not a recognized shape, bake the raw doodle
+            bake_raw_stroke()
 
     def get_current_color(self):
         if self.brush_mode == 'Rainbow' or self.brush_mode == 'Neon':
@@ -147,6 +196,7 @@ class PremiumCanvas:
         return self.draw_color
 
     def draw_ui(self, frame):
+        # Render Premium Menu
         overlay = frame.copy()
         draw_rounded_rect(overlay, (20, 20), (self.w - 20, 140), (40, 40, 40), -1, 20)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
@@ -183,8 +233,12 @@ class PremiumCanvas:
             if ix <= x <= ix + 80 and 80 <= y <= 130:
                 if 'color' in item: self.draw_color = item['color']
                 elif 'action' in item:
-                    if item['action'] == 'clear': self.canvas[:] = 0; self.glow_layer[:] = 0
-                    if item['action'] == 'save': cv2.imwrite('masterpiece.png', self.final_composite)
+                    if item['action'] == 'clear': 
+                        self.canvas[:] = 0
+                        self.glow_layer[:] = 0
+                        self.active_stroke_layer[:] = 0
+                    if item['action'] == 'save': 
+                        cv2.imwrite('masterpiece.png', self.final_composite)
                 elif 'label' in item and self.active_category == 'Brushes':
                     self.brush_mode = item['label']
                 time.sleep(0.2)
@@ -202,7 +256,7 @@ class PremiumCanvas:
             gesture = 'IDLE'
             if results.multi_hand_landmarks:
                 for hand_landmarks in results.multi_hand_landmarks:
-                    # Robust HAND_CONNECTIONS access via the hands module itself
+                    # Draw tracking skeleton
                     self.mp_draw.draw_landmarks(
                         frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS
                     )
@@ -217,35 +271,50 @@ class PremiumCanvas:
                     if gesture == 'DRAW':
                         if self.prev_x == 0: self.prev_x, self.prev_y = self.smooth_x, self.smooth_y
                         color = self.get_current_color()
-                        target = self.glow_layer if self.brush_mode == 'Neon' else self.canvas
-                        cv2.line(target, (self.prev_x, self.prev_y), (self.smooth_x, self.smooth_y), color, self.brush_size)
+                        
+                        # Draw to temporary stroke layer so we can clear it before snapping to shape
+                        cv2.line(self.active_stroke_layer, (self.prev_x, self.prev_y), (self.smooth_x, self.smooth_y), color, self.brush_size)
+                        
                         self.current_stroke.append((self.smooth_x, self.smooth_y))
                         self.prev_x, self.prev_y = self.smooth_x, self.smooth_y
+                        
                     elif gesture == 'ERASE':
                         palm_x, palm_y = int(lms[9].x * self.w), int(lms[9].y * self.h)
                         cv2.circle(self.canvas, (palm_x, palm_y), 60, (0, 0, 0), -1)
                         cv2.circle(self.glow_layer, (palm_x, palm_y), 65, (0, 0, 0), -1)
+                        cv2.circle(self.active_stroke_layer, (palm_x, palm_y), 60, (0, 0, 0), -1)
                         cv2.circle(frame, (palm_x, palm_y), 60, (255, 255, 255), 2)
                         self.prev_x = 0
+                        
                     elif gesture == 'SELECT':
                         cv2.circle(frame, (self.smooth_x, self.smooth_y), 10, (255, 0, 255), -1)
                         self.handle_click(self.smooth_x, self.smooth_y)
                         if self.current_stroke:
                             self.process_shape()
                             self.current_stroke = []
+                            self.active_stroke_layer[:] = 0 # Stroke is baked or snapped, clear the temp layer
                         self.prev_x = 0
+                        
                     else:
                         if self.current_stroke:
                             self.process_shape()
                             self.current_stroke = []
+                            self.active_stroke_layer[:] = 0 # Clear the temp layer
                         self.prev_x = 0
 
+            # Composite Canvas layers
             glow_blurred = cv2.GaussianBlur(self.glow_layer, (25, 25), 0)
-            gray = cv2.cvtColor(self.canvas, cv2.COLOR_BGR2GRAY)
+            
+            # Combine permanent drawing and active temporary stroke
+            combined_drawing = cv2.add(self.canvas, self.active_stroke_layer)
+            
+            gray = cv2.cvtColor(combined_drawing, cv2.COLOR_BGR2GRAY)
             _, mask = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
             
+            # Final Blend
             self.final_composite = cv2.addWeighted(frame, 1.0, glow_blurred, 1.0, 0)
-            self.final_composite = np.where(mask[:, :, None] == 255, self.canvas, self.final_composite)
+            self.final_composite = np.where(mask[:, :, None] == 255, combined_drawing, self.final_composite)
+            
             self.draw_ui(self.final_composite)
             
             cv2.imshow("Premium AI Canvas", self.final_composite)
