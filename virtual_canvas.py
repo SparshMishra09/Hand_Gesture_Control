@@ -18,14 +18,13 @@ import cv2
 # --- Robust MediaPipe Import Handling ---
 try:
     import mediapipe as mp
+    # Try standard path first, then fall back to internal python path
     try:
         from mediapipe.solutions import hands as mp_hands
         from mediapipe.solutions import drawing_utils as mp_drawing
-        from mediapipe.solutions import hand_connections as mp_connections
     except (ImportError, AttributeError):
         from mediapipe.python.solutions import hands as mp_hands
         from mediapipe.python.solutions import drawing_utils as mp_drawing
-        from mediapipe.python.solutions import hand_connections as mp_connections
 except Exception as e:
     print(f"\n[!] Critical: Failed to load MediaPipe: {e}")
     sys.exit(1)
@@ -60,12 +59,12 @@ class PremiumCanvas:
         self.glow_layer = np.zeros((self.h, self.w, 3), dtype=np.uint8)
         
         # MediaPipe
-        self.hands_detector = mp_hands.Hands(
+        self.mp_hands = mp_hands
+        self.mp_draw = mp_drawing
+        self.hands_detector = self.mp_hands.Hands(
             static_image_mode=False, max_num_hands=1,
             model_complexity=1, min_detection_confidence=0.8, min_tracking_confidence=0.8
         )
-        self.mp_draw = mp_drawing
-        self.mp_connections = mp_connections
         
         # UI State
         self.active_category = 'Colors'
@@ -100,20 +99,16 @@ class PremiumCanvas:
         }
 
     def detect_gesture(self, landmarks):
-        # Finger statuses (True if finger is UP)
-        # Finger Tip indices: 4, 8, 12, 16, 20
-        # Finger PIP indices: 2, 6, 10, 14, 18
-        
+        # Index
         idx_up = landmarks[8].y < landmarks[6].y
+        # Middle
         mid_up = landmarks[12].y < landmarks[10].y
+        # Ring
         ring_up = landmarks[16].y < landmarks[14].y
+        # Pinky
         pinky_up = landmarks[20].y < landmarks[18].y
         
-        # Thumb is slightly different (X-axis based detection)
-        # Note: Flip logic means thumb detection needs to be relative to index
-        thumb_up = landmarks[4].x > landmarks[3].x if landmarks[4].x > landmarks[17].x else landmarks[4].x < landmarks[3].x
-        
-        # PALM ERASE: All 5 fingers extended
+        # PALM ERASE: All 4 main fingers extended
         if idx_up and mid_up and ring_up and pinky_up:
             return 'ERASE'
         
@@ -130,20 +125,20 @@ class PremiumCanvas:
     def process_shape(self):
         if len(self.current_stroke) < 20: return
         
-        # Convert stroke to contour
         pts = np.array(self.current_stroke, dtype=np.int32)
         epsilon = 0.04 * cv2.arcLength(pts, True)
         approx = cv2.approxPolyDP(pts, epsilon, True)
         
+        color = self.get_current_color()
         if len(approx) == 3: # Triangle
-            cv2.drawContours(self.canvas, [approx], 0, self.get_current_color(), self.brush_size)
+            cv2.drawContours(self.canvas, [approx], 0, color, self.brush_size)
         elif len(approx) == 4: # Square/Rectangle
             x, y, w, h = cv2.boundingRect(pts)
-            cv2.rectangle(self.canvas, (x, y), (x + w, y + h), self.get_current_color(), self.brush_size)
-        elif len(approx) > 6: # Circle approximation
+            cv2.rectangle(self.canvas, (x, y), (x + w, y + h), color, self.brush_size)
+        elif len(approx) > 6: # Circle
             (x, y), radius = cv2.minEnclosingCircle(pts)
             center = (int(x), int(y))
-            cv2.circle(self.canvas, center, int(radius), self.get_current_color(), self.brush_size)
+            cv2.circle(self.canvas, center, int(radius), color, self.brush_size)
 
     def get_current_color(self):
         if self.brush_mode == 'Rainbow' or self.brush_mode == 'Neon':
@@ -152,12 +147,10 @@ class PremiumCanvas:
         return self.draw_color
 
     def draw_ui(self, frame):
-        # Premium Glass Overlay
         overlay = frame.copy()
         draw_rounded_rect(overlay, (20, 20), (self.w - 20, 140), (40, 40, 40), -1, 20)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
         
-        # Category Tabs
         for i, cat in enumerate(self.categories):
             x = 50 + i * 150
             color = (255, 255, 255) if self.active_category == cat else (150, 150, 150)
@@ -165,7 +158,6 @@ class PremiumCanvas:
             if self.active_category == cat:
                 cv2.line(frame, (x, 70), (x + 80, 70), (255, 255, 255), 2)
 
-        # Dynamic Submenu
         items = self.menu_items[self.active_category]
         for i, item in enumerate(items):
             x = 50 + i * 100
@@ -179,14 +171,12 @@ class PremiumCanvas:
                 cv2.putText(frame, item['label'], (x, y + 5), cv2.FONT_HERSHEY_DUPLEX, 0.5, color, 1, cv2.LINE_AA)
 
     def handle_click(self, x, y):
-        # Check Categories
         for i, cat in enumerate(self.categories):
             cx = 50 + i * 150
             if cx <= x <= cx + 120 and 30 <= y <= 80:
                 self.active_category = cat
                 return
 
-        # Check Items
         items = self.menu_items[self.active_category]
         for i, item in enumerate(items):
             ix = 50 + i * 100
@@ -204,8 +194,6 @@ class PremiumCanvas:
             ret, frame = self.cap.read()
             if not ret: break
             frame = cv2.flip(frame, 1)
-            
-            # Update States
             self.hue += 2
             
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -214,34 +202,31 @@ class PremiumCanvas:
             gesture = 'IDLE'
             if results.multi_hand_landmarks:
                 for hand_landmarks in results.multi_hand_landmarks:
-                    # RESTORE Hand Tracking Visualization
-                    self.mp_draw.draw_landmarks(frame, hand_landmarks, self.mp_connections.HAND_CONNECTIONS)
+                    # Robust HAND_CONNECTIONS access via the hands module itself
+                    self.mp_draw.draw_landmarks(
+                        frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS
+                    )
                     
                     lms = hand_landmarks.landmark
                     gesture = self.detect_gesture(lms)
                     
-                    # Finger tracking with EMA smoothing
                     raw_x, raw_y = int(lms[8].x * self.w), int(lms[8].y * self.h)
                     self.smooth_x = int(0.6 * raw_x + 0.4 * self.smooth_x)
                     self.smooth_y = int(0.6 * raw_y + 0.4 * self.smooth_y)
                     
                     if gesture == 'DRAW':
                         if self.prev_x == 0: self.prev_x, self.prev_y = self.smooth_x, self.smooth_y
-                        
                         color = self.get_current_color()
                         target = self.glow_layer if self.brush_mode == 'Neon' else self.canvas
                         cv2.line(target, (self.prev_x, self.prev_y), (self.smooth_x, self.smooth_y), color, self.brush_size)
-                        
                         self.current_stroke.append((self.smooth_x, self.smooth_y))
                         self.prev_x, self.prev_y = self.smooth_x, self.smooth_y
-                        
                     elif gesture == 'ERASE':
                         palm_x, palm_y = int(lms[9].x * self.w), int(lms[9].y * self.h)
                         cv2.circle(self.canvas, (palm_x, palm_y), 60, (0, 0, 0), -1)
                         cv2.circle(self.glow_layer, (palm_x, palm_y), 65, (0, 0, 0), -1)
                         cv2.circle(frame, (palm_x, palm_y), 60, (255, 255, 255), 2)
                         self.prev_x = 0
-                        
                     elif gesture == 'SELECT':
                         cv2.circle(frame, (self.smooth_x, self.smooth_y), 10, (255, 0, 255), -1)
                         self.handle_click(self.smooth_x, self.smooth_y)
@@ -255,14 +240,12 @@ class PremiumCanvas:
                             self.current_stroke = []
                         self.prev_x = 0
 
-            # Composite Layers
             glow_blurred = cv2.GaussianBlur(self.glow_layer, (25, 25), 0)
             gray = cv2.cvtColor(self.canvas, cv2.COLOR_BGR2GRAY)
             _, mask = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
             
             self.final_composite = cv2.addWeighted(frame, 1.0, glow_blurred, 1.0, 0)
             self.final_composite = np.where(mask[:, :, None] == 255, self.canvas, self.final_composite)
-            
             self.draw_ui(self.final_composite)
             
             cv2.imshow("Premium AI Canvas", self.final_composite)
