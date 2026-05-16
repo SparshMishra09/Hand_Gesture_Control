@@ -3,8 +3,9 @@ AI Virtual Canvas - Premium Edition
 An interactive, high-performance air-drawing application with:
 - Intelligent Shape Snapping (Circle, Square, Triangle)
 - Rainbow & Neon Glow Brushes
-- Fist-to-Erase Gesture
+- Palm-to-Erase Gesture (All 5 fingers up)
 - Premium Glassmorphism UI with smooth transitions
+- Real-time Hand Tracking Visualization
 """
 
 import os
@@ -20,9 +21,11 @@ try:
     try:
         from mediapipe.solutions import hands as mp_hands
         from mediapipe.solutions import drawing_utils as mp_drawing
+        from mediapipe.solutions import hand_connections as mp_connections
     except (ImportError, AttributeError):
         from mediapipe.python.solutions import hands as mp_hands
         from mediapipe.python.solutions import drawing_utils as mp_drawing
+        from mediapipe.python.solutions import hand_connections as mp_connections
 except Exception as e:
     print(f"\n[!] Critical: Failed to load MediaPipe: {e}")
     sys.exit(1)
@@ -62,6 +65,7 @@ class PremiumCanvas:
             model_complexity=1, min_detection_confidence=0.8, min_tracking_confidence=0.8
         )
         self.mp_draw = mp_drawing
+        self.mp_connections = mp_connections
         
         # UI State
         self.active_category = 'Colors'
@@ -72,10 +76,6 @@ class PremiumCanvas:
         self.prev_x, self.prev_y = 0, 0
         self.smooth_x, self.smooth_y = 0, 0
         self.current_stroke = []
-        
-        # Animation
-        self.menu_y = 0
-        self.target_menu_y = 100
         
         # Menus
         self.categories = ['Colors', 'Brushes', 'Actions']
@@ -100,23 +100,31 @@ class PremiumCanvas:
         }
 
     def detect_gesture(self, landmarks):
-        # Fist Detection: Tips of all fingers are closer to wrist than PIPs
-        tips = [8, 12, 16, 20]
-        pips = [6, 10, 14, 18]
-        wrist_y = landmarks[0].y
+        # Finger statuses (True if finger is UP)
+        # Finger Tip indices: 4, 8, 12, 16, 20
+        # Finger PIP indices: 2, 6, 10, 14, 18
         
-        fist_count = 0
-        for t, p in zip(tips, pips):
-            if landmarks[t].y > landmarks[p].y: # Tip is "below" PIP (remember Y-axis is inverted)
-                fist_count += 1
-        
-        # Simple Logic: Tip 8 up = Draw, Tips 8 & 12 up = Select
         idx_up = landmarks[8].y < landmarks[6].y
         mid_up = landmarks[12].y < landmarks[10].y
+        ring_up = landmarks[16].y < landmarks[14].y
+        pinky_up = landmarks[20].y < landmarks[18].y
         
-        if fist_count >= 3: return 'ERASE'
-        if idx_up and mid_up: return 'SELECT'
-        if idx_up: return 'DRAW'
+        # Thumb is slightly different (X-axis based detection)
+        # Note: Flip logic means thumb detection needs to be relative to index
+        thumb_up = landmarks[4].x > landmarks[3].x if landmarks[4].x > landmarks[17].x else landmarks[4].x < landmarks[3].x
+        
+        # PALM ERASE: All 5 fingers extended
+        if idx_up and mid_up and ring_up and pinky_up:
+            return 'ERASE'
+        
+        # SELECTION MODE: Index and Middle up
+        if idx_up and mid_up:
+            return 'SELECT'
+            
+        # DRAW MODE: Only Index up
+        if idx_up and not mid_up:
+            return 'DRAW'
+            
         return 'IDLE'
 
     def process_shape(self):
@@ -126,9 +134,6 @@ class PremiumCanvas:
         pts = np.array(self.current_stroke, dtype=np.int32)
         epsilon = 0.04 * cv2.arcLength(pts, True)
         approx = cv2.approxPolyDP(pts, epsilon, True)
-        
-        # Clean the messy line from canvas before snapping
-        # (This requires a bit of clever masking or redrawing, but for now we draw the snap on top)
         
         if len(approx) == 3: # Triangle
             cv2.drawContours(self.canvas, [approx], 0, self.get_current_color(), self.brush_size)
@@ -208,53 +213,53 @@ class PremiumCanvas:
             
             gesture = 'IDLE'
             if results.multi_hand_landmarks:
-                lms = results.multi_hand_landmarks[0].landmark
-                gesture = self.detect_gesture(lms)
-                
-                # Finger tracking with EMA smoothing
-                raw_x, raw_y = int(lms[8].x * self.w), int(lms[8].y * self.h)
-                self.smooth_x = int(0.6 * raw_x + 0.4 * self.smooth_x)
-                self.smooth_y = int(0.6 * raw_y + 0.4 * self.smooth_y)
-                
-                if gesture == 'DRAW':
-                    if self.prev_x == 0: self.prev_x, self.prev_y = self.smooth_x, self.smooth_y
+                for hand_landmarks in results.multi_hand_landmarks:
+                    # RESTORE Hand Tracking Visualization
+                    self.mp_draw.draw_landmarks(frame, hand_landmarks, self.mp_connections.HAND_CONNECTIONS)
                     
-                    color = self.get_current_color()
-                    target = self.glow_layer if self.brush_mode == 'Neon' else self.canvas
-                    cv2.line(target, (self.prev_x, self.prev_y), (self.smooth_x, self.smooth_y), color, self.brush_size)
+                    lms = hand_landmarks.landmark
+                    gesture = self.detect_gesture(lms)
                     
-                    self.current_stroke.append((self.smooth_x, self.smooth_y))
-                    self.prev_x, self.prev_y = self.smooth_x, self.smooth_y
+                    # Finger tracking with EMA smoothing
+                    raw_x, raw_y = int(lms[8].x * self.w), int(lms[8].y * self.h)
+                    self.smooth_x = int(0.6 * raw_x + 0.4 * self.smooth_x)
+                    self.smooth_y = int(0.6 * raw_y + 0.4 * self.smooth_y)
                     
-                elif gesture == 'ERASE':
-                    palm_x, palm_y = int(lms[9].x * self.w), int(lms[9].y * self.h)
-                    cv2.circle(self.canvas, (palm_x, palm_y), 50, (0, 0, 0), -1)
-                    cv2.circle(self.glow_layer, (palm_x, palm_y), 55, (0, 0, 0), -1)
-                    cv2.circle(frame, (palm_x, palm_y), 50, (255, 255, 255), 2)
-                    self.prev_x = 0
-                    
-                elif gesture == 'SELECT':
-                    cv2.circle(frame, (self.smooth_x, self.smooth_y), 10, (255, 0, 255), -1)
-                    self.handle_click(self.smooth_x, self.smooth_y)
-                    if self.current_stroke:
-                        self.process_shape()
-                        self.current_stroke = []
-                    self.prev_x = 0
-                else:
-                    if self.current_stroke:
-                        self.process_shape()
-                        self.current_stroke = []
-                    self.prev_x = 0
+                    if gesture == 'DRAW':
+                        if self.prev_x == 0: self.prev_x, self.prev_y = self.smooth_x, self.smooth_y
+                        
+                        color = self.get_current_color()
+                        target = self.glow_layer if self.brush_mode == 'Neon' else self.canvas
+                        cv2.line(target, (self.prev_x, self.prev_y), (self.smooth_x, self.smooth_y), color, self.brush_size)
+                        
+                        self.current_stroke.append((self.smooth_x, self.smooth_y))
+                        self.prev_x, self.prev_y = self.smooth_x, self.smooth_y
+                        
+                    elif gesture == 'ERASE':
+                        palm_x, palm_y = int(lms[9].x * self.w), int(lms[9].y * self.h)
+                        cv2.circle(self.canvas, (palm_x, palm_y), 60, (0, 0, 0), -1)
+                        cv2.circle(self.glow_layer, (palm_x, palm_y), 65, (0, 0, 0), -1)
+                        cv2.circle(frame, (palm_x, palm_y), 60, (255, 255, 255), 2)
+                        self.prev_x = 0
+                        
+                    elif gesture == 'SELECT':
+                        cv2.circle(frame, (self.smooth_x, self.smooth_y), 10, (255, 0, 255), -1)
+                        self.handle_click(self.smooth_x, self.smooth_y)
+                        if self.current_stroke:
+                            self.process_shape()
+                            self.current_stroke = []
+                        self.prev_x = 0
+                    else:
+                        if self.current_stroke:
+                            self.process_shape()
+                            self.current_stroke = []
+                        self.prev_x = 0
 
             # Composite Layers
-            # Blur the glow layer for neon effect
             glow_blurred = cv2.GaussianBlur(self.glow_layer, (25, 25), 0)
-            
-            # Masking
             gray = cv2.cvtColor(self.canvas, cv2.COLOR_BGR2GRAY)
             _, mask = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
             
-            # Combine everything
             self.final_composite = cv2.addWeighted(frame, 1.0, glow_blurred, 1.0, 0)
             self.final_composite = np.where(mask[:, :, None] == 255, self.canvas, self.final_composite)
             
