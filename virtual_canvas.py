@@ -57,11 +57,8 @@ class PremiumCanvas:
         self.h, self.w = frame.shape[:2]
         
         # --- LAYER ARCHITECTURE ---
-        # 1. Permanent Canvas (Standard/Rainbow)
         self.canvas = np.zeros((self.h, self.w, 3), dtype=np.uint8)
-        # 2. Permanent Glow Layer (Neon core)
         self.glow_layer = np.zeros((self.h, self.w, 3), dtype=np.uint8)
-        # 3. Transient Stroke Layer (Active drawing before snapping/baking)
         self.active_stroke_layer = np.zeros((self.h, self.w, 3), dtype=np.uint8)
         
         # MediaPipe Instance
@@ -80,7 +77,7 @@ class PremiumCanvas:
         self.hue = 0
         self.prev_x, self.prev_y = 0, 0
         self.smooth_x, self.smooth_y = 0, 0
-        self.current_stroke = []
+        self.current_stroke = [] # List of tuples: (x, y, color)
         
         # Menus
         self.categories = ['Colors', 'Brushes', 'Actions']
@@ -110,79 +107,81 @@ class PremiumCanvas:
         ring_up = landmarks[16].y < landmarks[14].y
         pinky_up = landmarks[20].y < landmarks[18].y
         
-        # PALM ERASE: All 4 main fingers extended
         if idx_up and mid_up and ring_up and pinky_up:
             return 'ERASE'
-        # SELECTION MODE: Index and Middle up
         if idx_up and mid_up:
             return 'SELECT'
-        # DRAW MODE: Only Index up
         if idx_up and not mid_up:
             return 'DRAW'
         return 'IDLE'
 
+    def get_current_color(self, frame_hue=None):
+        """Calculates current color based on brush mode and global hue."""
+        h = frame_hue if frame_hue is not None else self.hue
+        if self.brush_mode in ['Rainbow', 'Neon']:
+            hsv = np.uint8([[[h % 180, 255, 255]]])
+            return tuple(map(int, cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0][0]))
+        return self.draw_color
+
     def process_shape(self):
         """Intelligent Shape Recognition with Robust Geometric Heuristics"""
-        # Select target layer based on brush mode
         target = self.glow_layer if self.brush_mode == 'Neon' else self.canvas
-        color = self.get_current_color()
         
         def bake_raw_stroke():
             """Fallback: Permanently write the active stroke if no shape detected"""
             for i in range(1, len(self.current_stroke)):
-                cv2.line(target, self.current_stroke[i-1], self.current_stroke[i], color, self.brush_size)
+                p1_x, p1_y, p1_c = self.current_stroke[i-1]
+                p2_x, p2_y, p2_c = self.current_stroke[i]
+                cv2.line(target, (p1_x, p1_y), (p2_x, p2_y), p2_c, self.brush_size)
 
         if len(self.current_stroke) < 20:
             bake_raw_stroke()
             return
             
-        pts = np.array(self.current_stroke, dtype=np.int32).reshape((-1, 1, 2))
+        # Extract coordinates for geometric analysis
+        coords = np.array([(p[0], p[1]) for p in self.current_stroke], dtype=np.int32).reshape((-1, 1, 2))
         
         # 1. Closure & Dimension Check
         p1 = self.current_stroke[0]
         p2 = self.current_stroke[-1]
         dist_close = math.hypot(p1[0] - p2[0], p1[1] - p2[1])
         
-        x, y, w, h = cv2.boundingRect(pts)
+        x, y, w, h = cv2.boundingRect(coords)
         diag = math.hypot(w, h)
         
-        # Relaxed heuristics for easier snapping
         if diag < 30 or dist_close > 0.4 * diag:
             bake_raw_stroke()
             return
             
-        area = cv2.contourArea(pts)
-        perimeter = cv2.arcLength(pts, True)
+        area = cv2.contourArea(coords)
+        perimeter = cv2.arcLength(coords, True)
         if perimeter == 0 or area < 150:
             bake_raw_stroke()
             return
             
         # 2. Feature Extraction
         circularity = 4 * np.pi * area / (perimeter * perimeter)
-        epsilon = 0.05 * perimeter # Increased epsilon for better poly approximation
-        approx = cv2.approxPolyDP(pts, epsilon, True)
+        epsilon = 0.05 * perimeter
+        approx = cv2.approxPolyDP(coords, epsilon, True)
         vertices = len(approx)
+        
+        # Use the final color of the stroke for the snapped shape
+        final_color = self.current_stroke[-1][2]
         
         # 3. Snap Logic
         if circularity > 0.7:
-            (cx, cy), radius = cv2.minEnclosingCircle(pts)
-            cv2.circle(target, (int(cx), int(cy)), int(radius), color, self.brush_size)
+            (cx, cy), radius = cv2.minEnclosingCircle(coords)
+            cv2.circle(target, (int(cx), int(cy)), int(radius), final_color, self.brush_size)
         elif vertices == 3:
-            cv2.drawContours(target, [approx], 0, color, self.brush_size)
+            cv2.drawContours(target, [approx], 0, final_color, self.brush_size)
         elif vertices == 4:
             box_area = w * h
             if box_area > 0 and area / box_area > 0.5:
-                cv2.rectangle(target, (x, y), (x + w, y + h), color, self.brush_size)
+                cv2.rectangle(target, (x, y), (x + w, y + h), final_color, self.brush_size)
             else:
                 bake_raw_stroke()
         else:
             bake_raw_stroke()
-
-    def get_current_color(self):
-        if self.brush_mode in ['Rainbow', 'Neon']:
-            hsv = np.uint8([[[self.hue % 180, 255, 255]]])
-            return tuple(map(int, cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0][0]))
-        return self.draw_color
 
     def draw_ui(self, frame):
         overlay = frame.copy()
@@ -236,7 +235,7 @@ class PremiumCanvas:
             ret, frame = self.cap.read()
             if not ret: break
             frame = cv2.flip(frame, 1)
-            self.hue += 2
+            self.hue = (self.hue + 2) % 180 # HSV hue is 0-179 in OpenCV
             
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = self.hands_detector.process(rgb)
@@ -258,13 +257,16 @@ class PremiumCanvas:
                     if gesture == 'DRAW':
                         if self.prev_x == 0: self.prev_x, self.prev_y = self.smooth_x, self.smooth_y
                         color = self.get_current_color()
+                        
                         # Draw ONLY on transient layer
                         cv2.line(self.active_stroke_layer, (self.prev_x, self.prev_y), (self.smooth_x, self.smooth_y), color, self.brush_size)
-                        self.current_stroke.append((self.smooth_x, self.smooth_y))
+                        
+                        # Store coordinate AND color at this point to preserve rainbow spectrum when baking/snapping
+                        self.current_stroke.append((self.smooth_x, self.smooth_y, color))
                         self.prev_x, self.prev_y = self.smooth_x, self.smooth_y
+                        
                     elif gesture == 'ERASE':
                         palm_x, palm_y = int(lms[9].x * self.w), int(lms[9].y * self.h)
-                        # Clear ALL layers at palm position
                         cv2.circle(self.canvas, (palm_x, palm_y), 65, (0, 0, 0), -1)
                         cv2.circle(self.glow_layer, (palm_x, palm_y), 70, (0, 0, 0), -1)
                         cv2.circle(self.active_stroke_layer, (palm_x, palm_y), 65, (0, 0, 0), -1)
@@ -277,13 +279,13 @@ class PremiumCanvas:
                         if self.current_stroke:
                             self.process_shape()
                             self.current_stroke = []
-                            self.active_stroke_layer[:] = 0 # FULL reset of transient layer
+                            self.active_stroke_layer[:] = 0
                         self.prev_x, self.prev_y = 0, 0
                     else:
                         if self.current_stroke:
                             self.process_shape()
                             self.current_stroke = []
-                            self.active_stroke_layer[:] = 0 # FULL reset of transient layer
+                            self.active_stroke_layer[:] = 0
                         self.prev_x, self.prev_y = 0, 0
             else:
                 if self.current_stroke:
@@ -293,20 +295,13 @@ class PremiumCanvas:
                 self.prev_x, self.prev_y = 0, 0
 
             # --- COMPOSITING ---
-            # 1. Background (Webcam)
-            # 2. Add Neon Glow (blurred glow_layer)
             glow_blurred = cv2.GaussianBlur(self.glow_layer, (25, 25), 0)
-            
-            # 3. Combine Permanent Drawing and Active Transient Stroke
             combined_drawing = cv2.add(self.canvas, self.active_stroke_layer)
             
-            # 4. Masking for final composite
             gray = cv2.cvtColor(combined_drawing, cv2.COLOR_BGR2GRAY)
             _, mask = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
             
-            # Blend Glow with webcam
             frame_with_glow = cv2.addWeighted(frame, 1.0, glow_blurred, 1.2, 0)
-            # Blend Drawing on top
             self.final_composite = np.where(mask[:, :, None] == 255, combined_drawing, frame_with_glow)
             
             self.draw_ui(self.final_composite)
